@@ -3,11 +3,12 @@ import os, os.path
 import shutil
 import cPickle as pickle
 import numpy as np
+import math
 import cv2
 
 DEFAULT_HESSIAN = 1000
 DEFAULT_GMRATIO = 0.8
-DEFAULT_MIN_MATCHES = 20
+
 
 def is_image_file(filename):
     _, ext = os.path.splitext(filename)
@@ -76,6 +77,10 @@ def save_keypoints_descriptors(hessian, all_kps, all_descs, output_dir):
         kp_descs_pickle.append(kp_desc)
         
     keypoints_db = os.path.join(output_dir, "woolf.kpd")
+    # Delete previous keypoints db if it exists
+    if os.path.exists(keypoints_db):
+        os.remove(keypoints_db)                 
+    
     try:
         pickle.dump(kp_descs_pickle, open(keypoints_db, "wb"))
         print "Keypoints database saved to " + keypoints_db
@@ -112,18 +117,25 @@ def load_keypoints_descriptors(keypoints_db):
     
     return hessian, all_kps, all_descs    
 	
-def do_classify(test_dir, keypoints_db, output_dir,  
-                num_min_matches = DEFAULT_MIN_MATCHES, gm_ratio = DEFAULT_GMRATIO):
+def do_classify(test_dir, keypoints_db, output_dir, gm_ratio = DEFAULT_GMRATIO):
     if output_dir == "":
-        print "Classify mode requires output directory (specify using -o or --output)"
-        return
+        output_dir = test_dir + "_out"
         
     if keypoints_db == "":
         print "A keypoints database should be specified (specify using -k or --keypoints)"
         return
  
     hessian, all_kps, all_descs = load_keypoints_descriptors(keypoints_db)
+    min_num_hits = len(all_descs)/3
+    if min_num_hits == 0:
+        min_num_hits = 1
+    print "Images must have at least " + str(min_num_hits) + " hits for a positive classification"
     
+    if os.path.exists(output_dir):
+        ## Delete its contents!
+        print "Removing " + output_dir + " prior to classification..."
+        shutil.rmtree(output_dir)
+        
     output_dir_yes = os.path.join(output_dir, "yes_logo")
     output_dir_no = os.path.join(output_dir, "no_logo")
     if not os.path.exists(output_dir):
@@ -133,7 +145,6 @@ def do_classify(test_dir, keypoints_db, output_dir,
     if not os.path.exists(output_dir_no):    
         os.makedirs(output_dir_no)
 
-    print "Images must have at least " + str(num_min_matches) + " good matches to produce a positive classification" 
     files_to_proc = get_image_files(test_dir)
     if len(files_to_proc) == 0:
         print "Found no image files in " + test_dir
@@ -143,21 +154,23 @@ def do_classify(test_dir, keypoints_db, output_dir,
     bf = cv2.BFMatcher(cv2.NORM_L2)
             
     for qimg_pathname in files_to_proc:
-        print "Classifying " + qimg_pathname
+        print "\n-------------------------------------\nClassifying " + qimg_pathname
         _, qimg_filename = os.path.split(qimg_pathname)    
         
         qimg = cv2.imread(qimg_pathname, 0)
                                 
         ## Get the descriptors of the query image
         _, qdesc = surf.detectAndCompute(qimg, None)
-        print("Found " + str(len(qdesc)) + " descriptors in query image")
+        print "Found " + str(len(qdesc)) + " descriptors in query image"
         
         i = 1
+        num_hits = 0
         yes_logo = False
         for trdesc in all_descs:
             print "Trying with descriptor" + str(i) + " (" + str(len(trdesc)) + " descriptors)" 
             ## Find the best k matches between training descriptor and query descriptor
             ## NOTE: need to do np.asarray() in order for the function to work -- maybe a python version issue
+            ## Need to understand this better -- what exactly is being matched? What is the structure of the descriptors?? 
             matches = bf.knnMatch(np.asarray(qdesc, np.float32),
                                   np.asarray(trdesc, np.float32),k=2)
                        
@@ -167,13 +180,22 @@ def do_classify(test_dir, keypoints_db, output_dir,
                 if m.distance < gm_ratio*n.distance:
                     good_matches+=1
                     
-            print "Found " + str(good_matches) + " good matches " + str(good_matches >= num_min_matches)
-            # Only consider this image to be of class 1 if there are enough good matches
+            num_min_matches = math.floor(max(len(qdesc), len(trdesc)) * 0.065)   # 6.5% of the descriptors in either query or train image
+            print "Found " + str(good_matches) + " good matches (" + str(num_min_matches) + " required)" 
+        
+            # Only consider this image to be of class 1 (HAS LOGO) if there are enough good matches
+            ## Possible refinement: consider query image as class 1 only if there are 
+            ## at least j matches (1 <= j <= #trainingimgs)? No theoretical basis, but it's something :D
+            ## Perhaps num_min_matches should be a proportion of the number of features extracted from query and current training desc?
+            ## Also NUM_HITS should be a function of the number of training images read from the keypoints db??
+            ## Because query images with large number of descs (>1000) tend to be classified as YES LOGO
             if good_matches >= num_min_matches:
-                print "+++ " + qimg_pathname + " has LOGO!"
-                yes_logo = True
-                shutil.copyfile(qimg_pathname, os.path.join(output_dir_yes, qimg_filename))
-                break
+                num_hits+=1
+                if num_hits == min_num_hits:
+                    print "+++ Image produced " + str(num_hits) + " hits; " + qimg_pathname + " has LOGO!"
+                    yes_logo = True
+                    shutil.copyfile(qimg_pathname, os.path.join(output_dir_yes, qimg_filename))
+                    break
             i+=1
             
         if not yes_logo:
@@ -183,12 +205,11 @@ def do_classify(test_dir, keypoints_db, output_dir,
 def show_help():
     print "options: "
     print "-t, --training <training-data-dir>       Enter training mode and use given directory for training data"
-    print "-o, --output <output-dir>                Location of output descriptors (in training mode) or classified images (in classify mode)"
+    print "-o, --output <output-dir>                Location of output descriptors (in training mode) or classified images (in classify mode) -- default is no output in training mode, <img-dir>_out in classify mode"
     print "-c, --classify <img-dir>                 Enter classify mode and classify the images in the given directory"
     print "-k, --keypoints <keypoints-file>         Use given file as source of keypoints"
     print "-h, --hessian <hessian-value>            Hessian threshold value (only used when training -- default " + str(DEFAULT_HESSIAN) + ")"
-    print "-m, --minmatches <num-minimum>           Minimum number of good descriptor matches for a positive classification (only used when classifying -- default " + str(DEFAULT_MIN_MATCHES) + ")"
-
+    
 def main(argv):
     if len(argv) == 0:
         show_help()
@@ -202,9 +223,8 @@ def main(argv):
     training_mode = False
     classify_mode = False
     hessian = DEFAULT_HESSIAN
-    minmatches = DEFAULT_MIN_MATCHES
     try:
-        opts, args = getopt.getopt(argv,"h:t:o:c:k:m:",["hessian=", "training=","output=", "classify=", "keypoints=", "minmatches="])
+        opts, args = getopt.getopt(argv,"h:t:o:c:k:",["hessian=", "training=","output=", "classify=", "keypoints="])
     except getopt.GetoptError:
         show_help()
         sys.exit(2)
@@ -226,19 +246,12 @@ def main(argv):
                 print "Illegal value for -h/--hessian: " + arg
                 sys.exit(3)
             
-        elif opt in ("-m", "--minmatches"):
-            try:
-                minmatches = int(arg)
-            except ValueError:
-                print "Illegal value for -m/--minmatches: " + arg
-                sys.exit(3)
-            
     if not classify_mode and not training_mode:
         show_help()
         sys.exit(1)
     
     if classify_mode:
-        do_classify(test_dir, keypoints_db, output_dir, num_min_matches = minmatches)
+        do_classify(test_dir, keypoints_db, output_dir)
     elif training_mode:
         do_training(training_dir, output_dir, hessian)
             
