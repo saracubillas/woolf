@@ -117,7 +117,7 @@ def load_keypoints_descriptors(keypoints_db):
     
     return hessian, all_kps, all_descs    
 	
-def do_classify(test_dir, keypoints_db, output_dir, gm_ratio = DEFAULT_GMRATIO):
+def do_classify(test_dir, keypoints_db, output_dir, results_prefix, gm_ratio = DEFAULT_GMRATIO):
     if output_dir == "":
         output_dir = test_dir + "_out"
         
@@ -201,7 +201,43 @@ def do_classify(test_dir, keypoints_db, output_dir, gm_ratio = DEFAULT_GMRATIO):
         if not yes_logo:
             shutil.copyfile(qimg_pathname, os.path.join(output_dir_no, qimg_filename))
 	
+    if results_prefix != "":
+        show_classification_results(output_dir_yes, output_dir_no, results_prefix)
 
+def show_classification_results(output_dir_yes, output_dir_no, prefix):
+    yes_yes, yes_no = count_filename_matches(output_dir_yes, prefix)
+    no_yes, no_no = count_filename_matches(output_dir_no, prefix)
+    
+    print "\n-=-=-=-=-=- CLASSIFICATION RESULTS -=-=-=-=-=-"
+    print "Results were computed by checking if the filename starts with \"" + prefix + "\""
+    print "Column headers represent the truth, row headers represent the predictions done by the classifier"
+    print "%8s" % "YES" + "%5s" % "NO"
+    print "YES %4s" % str(yes_yes) + "%5s" % str(yes_no)
+    print "NO %5s" % str(no_yes) + "%5s" % str(no_no)
+    
+    ## Compute accuracy
+    total = yes_yes + yes_no + no_yes + no_no
+    correct = yes_yes + no_no
+    pct_correct = (correct/float(total)) * 100.0
+    pct_error = 100.0 - pct_correct
+    print "\nCorrectly classified: " + str(correct) + "/" + str(total) + " (%.2f" % pct_correct + "%% accuracy, %.2f" % pct_error + "% error rate)"
+        
+def count_filename_matches(dir, prefix):
+    yes_match = 0
+    no_match = 0
+    ## Get list of filenames in the given directory
+    pathnames = get_image_files(dir)
+    ## For each filename, check if it starts with the given prefix, 
+    ## and increment counters based on the result
+    for pname in pathnames:
+        _, fname = os.path.split(pname)    
+        if fname.lower().startswith(prefix):
+            yes_match += 1
+        else:
+            no_match += 1
+    
+    return yes_match, no_match
+    
 def show_help():
     print "options: "
     print "-t, --training <training-data-dir>       Enter training mode and use given directory for training data"
@@ -209,6 +245,7 @@ def show_help():
     print "-c, --classify <img-dir>                 Enter classify mode and classify the images in the given directory"
     print "-k, --keypoints <keypoints-file>         Use given file as source of keypoints"
     print "-h, --hessian <hessian-value>            Hessian threshold value (only used when training -- default " + str(DEFAULT_HESSIAN) + ")"
+    print "-r, --results <prefix-value>             Check results after classification by inspecting filenames (filename that starts with the given prefix means it contains the logo)"
     
 def main(argv):
     if len(argv) == 0:
@@ -223,8 +260,9 @@ def main(argv):
     training_mode = False
     classify_mode = False
     hessian = DEFAULT_HESSIAN
+    results_prefix = ""
     try:
-        opts, args = getopt.getopt(argv,"h:t:o:c:k:",["hessian=", "training=","output=", "classify=", "keypoints="])
+        opts, args = getopt.getopt(argv,"h:t:o:c:k:r:",["hessian=", "training=","output=", "classify=", "keypoints=", "results="])
     except getopt.GetoptError:
         show_help()
         sys.exit(2)
@@ -239,6 +277,8 @@ def main(argv):
             classify_mode = True
         elif opt in ("-k", "--keypoints"):
             keypoints_db = arg
+        elif opt in ("-r", "--results"):
+            results_prefix = arg
         elif opt in ("-h", "--hessian"):
             try:
                 hessian = arg
@@ -251,7 +291,7 @@ def main(argv):
         sys.exit(1)
     
     if classify_mode:
-        do_classify(test_dir, keypoints_db, output_dir)
+        do_classify(test_dir, keypoints_db, output_dir, results_prefix)
     elif training_mode:
         do_training(training_dir, output_dir, hessian)
             
