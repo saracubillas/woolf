@@ -5,10 +5,13 @@ import cPickle as pickle
 import numpy as np
 import math
 import cv2
+import pprint
+import kmeans
 
 DEFAULT_HESSIAN = 1000
 DEFAULT_GMRATIO = 0.8
 
+pp = pprint.PrettyPrinter(indent=4)
 
 def is_image_file(filename):
     _, ext = os.path.splitext(filename)
@@ -25,8 +28,7 @@ def get_image_files(dir):
                 full_path = os.path.join(root, file)
                 file_list.extend([full_path])
     return file_list
-    
-    
+        
 def do_training(training_dir, output_dir = "", hessian = DEFAULT_HESSIAN):
 
     if output_dir != "" and not os.path.exists(output_dir):
@@ -94,7 +96,7 @@ def load_keypoints_descriptors(keypoints_db):
         kp_descs_pickle = pickle.load(open(keypoints_db, "rb" ))
     except IOError:
         print "Could not open keypoints database file " + keypoints_db
-        return [], []
+        return 0, [], []
 
     hessian = kp_descs_pickle[0]
     print "Read hessian value: " + str(hessian)
@@ -117,7 +119,97 @@ def load_keypoints_descriptors(keypoints_db):
     
     return hessian, all_kps, all_descs    
 	
-def do_classify(test_dir, keypoints_db, output_dir, results_prefix, gm_ratio = DEFAULT_GMRATIO):
+def find_best_cluster(desc, centroids):
+    best_cluster = 0
+    least_distance = None
+    for cluster in range(len(centroids)):
+        c = centroids[cluster]
+        distance = np.linalg.norm(desc-c)
+        if least_distance is None or distance < least_distance:
+            least_distance = distance
+            best_cluster = cluster
+        
+    return best_cluster
+    
+def get_hist_difference(query_hist, training_hist):
+    ## ?? What's the best way to get the diff between (feature) histograms??
+    ## If we treat each histogram as a vector (with dim=# of bins), let's take the euclidean distance 
+    total = 0
+    for cluster in query_hist:
+        sq_diff = (len(query_hist[cluster]) - len(training_hist[cluster]))**2
+        #print "Cluster " + str(cluster) + ": " + str(diff) 
+        total += sq_diff
+    return math.sqrt(total)
+    
+def do_bof_classification_nn(qimg_pathname, qdescs, centroids, training_hist):
+    query_hist = {}
+    for qdesc in qdescs:
+        best_cluster = find_best_cluster(qdesc, centroids)
+        try:
+            query_hist[best_cluster].append(qdesc)
+        except KeyError:
+            query_hist[best_cluster] = [qdesc]
+    
+    hist_diff = get_hist_difference(query_hist, training_hist)
+    print "TOTAL DIFF: " + str(hist_diff)
+    yes_classify = (hist_diff < 195.0)   ## some threshold value
+    if yes_classify:
+        print "+++ Image " + qimg_pathname + " is a POSITIVE!"
+                
+    return yes_classify 
+    
+def do_bruteforce_classification(qimg_pathname, qdescs, all_descs, bf, min_num_hits):
+    i = 1
+    num_hits = 0
+    for trdescs in all_descs:
+        print "Trying with descriptor" + str(i) + " (" + str(len(trdescs)) + " descriptors)" 
+        ## Find the best k matches between training descriptor and query descriptor
+        ## NOTE: need to do np.asarray() in order for the function to work -- maybe a python version issue
+        ## Need to understand this better -- what exactly is being matched? What is the structure of the descriptors??
+        ## Each "descriptor" is actually an array of 128 float32 values -- it's SIFT/SURF's numerical representation of a feature
+        ## The keypoint structure contains metadata about the feature -- it's x,y location, octave, angle, etc.
+        ## If we treat each descriptor as a 128-d vector, knnMatch will then attempt to find the k nearest descriptor vectors
+        ## Note that qdesc is a set of descriptors, with each descriptor represented by 128 values 
+        ## For each descriptor q in qdesc, bf.knnMatch will attempt to find the k nearest neighbors of q in trdesc 
+        matches = bf.knnMatch(np.asarray(qdescs, np.float32),
+                              np.asarray(trdescs, np.float32),k=2)
+        ## The size of matches will then be equal to the size of the query descriptor set, BUT each element in the list has k (or less) match objects
+        ##print "len(matches): " + str(len(matches))
+        ##pp = pprint.PrettyPrinter(indent=4)
+        ##pp.pprint(matches)
+        
+        ## What is the structure of this matches list?
+        ## Each element in the matches list contains k (possibly less) "match" objects.
+        ## Each "match" contains queryIdx, trainIdx, imgIdx, and distance (between the descriptor qdesc[queryIdx] and trdesc[trainIdx])
+        
+        # Apply ratio test
+        ## The goal of this is to determine whether the distances of a pair of match objects is less than some threshold (in DLowe SIFT paper)
+        ## Since k=2, m and n will be two match objects for the same query image descriptor (i.e. m.queryIdx == n.queryIdx) but with two different
+        ## training image descriptors (i.e. m.trainIdx != n.trainIdx)
+        good_matches = 0
+        for m,n in matches:
+            if m.distance < DEFAULT_GMRATIO*n.distance:
+                good_matches+=1
+                
+        num_min_matches = math.floor(max(len(qdescs), len(trdescs)) * 0.065)   # 6.5% of the descriptors in either query or train image
+        print "Found " + str(good_matches) + " good matches (" + str(num_min_matches) + " required)" 
+    
+        # Only consider this image to be of class 1 (HAS LOGO) if there are enough good matches
+        ## Possible refinement: consider query image as class 1 only if there are 
+        ## at least j matches (1 <= j <= #trainingimgs)? No theoretical basis, but it's something :D
+        ## Perhaps num_min_matches should be a proportion of the number of features extracted from query and current training desc?
+        ## Also NUM_HITS should be a function of the number of training images read from the keypoints db??
+        ## Because query images with large number of descs (>1000) tend to be classified as YES LOGO
+        if good_matches >= num_min_matches:
+            num_hits+=1
+            if num_hits == min_num_hits:
+                print "+++ Image produced " + str(num_hits) + " hits; " + qimg_pathname + " is a POSITIVE!"
+                return True
+        i+=1
+            
+    return False
+
+def do_classify(test_dir, keypoints_db, output_dir, results_prefix, classify_mode_alg=1):
     if output_dir == "":
         output_dir = test_dir + "_out"
         
@@ -126,18 +218,36 @@ def do_classify(test_dir, keypoints_db, output_dir, results_prefix, gm_ratio = D
         return
  
     hessian, all_kps, all_descs = load_keypoints_descriptors(keypoints_db)
-    min_num_hits = len(all_descs)/3
-    if min_num_hits == 0:
-        min_num_hits = 1
-    print "Images must have at least " + str(min_num_hits) + " hits for a positive classification"
+    if len(all_descs) == 0:
+        print "No keypoints/descriptors loaded"
+        return
     
+    ## TODO this should be done in training stage and saved to file      
+    ## try to find k=50 clusters for the set of training descriptors that we have
+    ## flatten list of descs
+    if classify_mode_alg == 2:
+        all_descs2 = [item for sublist in all_descs for item in sublist]
+        centroids, training_hist = kmeans.cluster(all_descs2, 50)
+        ## TODO during training, do CH index comparison to find the "best" set of clustering
+        print "Done finding " + str(len(training_hist)) + " clusters in training set"
+        #for cluster in clusters:
+        #    print "Cluster " + str(cluster) + ": " + str(len(clusters[cluster])) + " points" 
+        #print "Centroids: " 
+        #pp.pprint(mu)
+        
+    if classify_mode_alg == 1:
+        min_num_hits = len(all_descs)/3
+        if min_num_hits == 0:
+            min_num_hits = 1
+        print "Images must have at least " + str(min_num_hits) + " hits for a positive classification"
+        
     if os.path.exists(output_dir):
         ## Delete its contents!
         print "Removing " + output_dir + " prior to classification..."
         shutil.rmtree(output_dir)
         
-    output_dir_yes = os.path.join(output_dir, "yes_logo")
-    output_dir_no = os.path.join(output_dir, "no_logo")
+    output_dir_yes = os.path.join(output_dir, "yes")
+    output_dir_no = os.path.join(output_dir, "no")
     if not os.path.exists(output_dir):
         os.makedirs(output_dir)
     if not os.path.exists(output_dir_yes):    
@@ -160,46 +270,20 @@ def do_classify(test_dir, keypoints_db, output_dir, results_prefix, gm_ratio = D
         qimg = cv2.imread(qimg_pathname, 0)
                                 
         ## Get the descriptors of the query image
-        _, qdesc = surf.detectAndCompute(qimg, None)
-        print "Found " + str(len(qdesc)) + " descriptors in query image"
+        _, qdescs = surf.detectAndCompute(qimg, None)
+        print "Found " + str(len(qdescs)) + " descriptors in query image"
+    
+        yes_classify = False
+        if classify_mode_alg == 1:
+            yes_classify = do_bruteforce_classification(qimg_pathname, qdescs, all_descs, bf, min_num_hits)
+        else:
+            yes_classify = do_bof_classification_nn(qimg_pathname, qdescs, centroids, training_hist)
         
-        i = 1
-        num_hits = 0
-        yes_logo = False
-        for trdesc in all_descs:
-            print "Trying with descriptor" + str(i) + " (" + str(len(trdesc)) + " descriptors)" 
-            ## Find the best k matches between training descriptor and query descriptor
-            ## NOTE: need to do np.asarray() in order for the function to work -- maybe a python version issue
-            ## Need to understand this better -- what exactly is being matched? What is the structure of the descriptors?? 
-            matches = bf.knnMatch(np.asarray(qdesc, np.float32),
-                                  np.asarray(trdesc, np.float32),k=2)
-                       
-            # Apply ratio test
-            good_matches = 0
-            for m,n in matches:
-                if m.distance < gm_ratio*n.distance:
-                    good_matches+=1
-                    
-            num_min_matches = math.floor(max(len(qdesc), len(trdesc)) * 0.065)   # 6.5% of the descriptors in either query or train image
-            print "Found " + str(good_matches) + " good matches (" + str(num_min_matches) + " required)" 
+        dest_path = os.path.join(output_dir_no, qimg_filename)
+        if yes_classify:
+            dest_path = os.path.join(output_dir_yes, qimg_filename)
         
-            # Only consider this image to be of class 1 (HAS LOGO) if there are enough good matches
-            ## Possible refinement: consider query image as class 1 only if there are 
-            ## at least j matches (1 <= j <= #trainingimgs)? No theoretical basis, but it's something :D
-            ## Perhaps num_min_matches should be a proportion of the number of features extracted from query and current training desc?
-            ## Also NUM_HITS should be a function of the number of training images read from the keypoints db??
-            ## Because query images with large number of descs (>1000) tend to be classified as YES LOGO
-            if good_matches >= num_min_matches:
-                num_hits+=1
-                if num_hits == min_num_hits:
-                    print "+++ Image produced " + str(num_hits) + " hits; " + qimg_pathname + " has LOGO!"
-                    yes_logo = True
-                    shutil.copyfile(qimg_pathname, os.path.join(output_dir_yes, qimg_filename))
-                    break
-            i+=1
-            
-        if not yes_logo:
-            shutil.copyfile(qimg_pathname, os.path.join(output_dir_no, qimg_filename))
+        shutil.copyfile(qimg_pathname, dest_path)
 	
     if results_prefix != "":
         show_classification_results(output_dir_yes, output_dir_no, results_prefix)
@@ -221,28 +305,29 @@ def show_classification_results(output_dir_yes, output_dir_no, prefix):
     pct_correct = (correct/float(total)) * 100.0
     pct_error = 100.0 - pct_correct
     print "\nCorrectly classified: " + str(correct) + "/" + str(total) + " (%.2f" % pct_correct + "%% accuracy, %.2f" % pct_error + "% error rate)"
-        
+            
 def count_filename_matches(dir, prefix):
     yes_match = 0
     no_match = 0
     ## Get list of filenames in the given directory
     pathnames = get_image_files(dir)
-    ## For each filename, check if it starts with the given prefix, 
+    ## For each filename, check if it starts with the given prefix,
     ## and increment counters based on the result
     for pname in pathnames:
-        _, fname = os.path.split(pname)    
+        _, fname = os.path.split(pname)
         if fname.lower().startswith(prefix):
             yes_match += 1
         else:
             no_match += 1
     
-    return yes_match, no_match
-    
+    return yes_match, no_match            
+            
 def show_help():
     print "options: "
     print "-t, --training <training-data-dir>       Enter training mode and use given directory for training data"
     print "-o, --output <output-dir>                Location of output descriptors (in training mode) or classified images (in classify mode) -- default is no output in training mode, <img-dir>_out in classify mode"
-    print "-c, --classify <img-dir>                 Enter classify mode and classify the images in the given directory"
+    print "-1, --classify1 <img-dir>                Enter classify 1 mode (using brute force matcher) and classify the images in the given directory"
+    print "-2, --classify2 <img-dir>                Enter classify 2 mode (using image histogram matcher) and classify the images in the given directory"
     print "-k, --keypoints <keypoints-file>         Use given file as source of keypoints"
     print "-h, --hessian <hessian-value>            Hessian threshold value (only used when training -- default " + str(DEFAULT_HESSIAN) + ")"
     print "-r, --results <prefix-value>             Check results after classification by inspecting filenames (filename that starts with the given prefix means it contains the logo)"
@@ -259,10 +344,11 @@ def main(argv):
     keypoints_db = ""
     training_mode = False
     classify_mode = False
+    classify_mode_alg = 0
     hessian = DEFAULT_HESSIAN
     results_prefix = ""
     try:
-        opts, args = getopt.getopt(argv,"h:t:o:c:k:r:",["hessian=", "training=","output=", "classify=", "keypoints=", "results="])
+        opts, args = getopt.getopt(argv,"h:t:o:1:2:k:r:",["hessian=", "training=","output=", "classify1=", "classify2=", "keypoints=", "results="])
     except getopt.GetoptError:
         show_help()
         sys.exit(2)
@@ -272,9 +358,15 @@ def main(argv):
             training_mode = True
         elif opt in ("-o", "--output"):
             output_dir = arg
-        elif opt in ("-c", "--classify"):
+        elif opt in ("-1", "--classify1"):
+        
             test_dir = arg
             classify_mode = True
+            classify_mode_alg = 1
+        elif opt in ("-2", "--classify2"):
+            test_dir = arg
+            classify_mode = True
+            classify_mode_alg = 2
         elif opt in ("-k", "--keypoints"):
             keypoints_db = arg
         elif opt in ("-r", "--results"):
@@ -291,7 +383,7 @@ def main(argv):
         sys.exit(1)
     
     if classify_mode:
-        do_classify(test_dir, keypoints_db, output_dir, results_prefix)
+        do_classify(test_dir, keypoints_db, output_dir, results_prefix, classify_mode_alg)
     elif training_mode:
         do_training(training_dir, output_dir, hessian)
             
