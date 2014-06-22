@@ -14,8 +14,7 @@ import backtype.storm.tuple.Tuple;
 import backtype.storm.tuple.Values;
 import backtype.storm.utils.Utils;
 
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
+
 import backtype.storm.spout.SpoutOutputCollector;
 
 import javax.imageio.ImageIO;
@@ -35,7 +34,7 @@ import java.util.List;
 public class ImageTopology {
 
   public static class TestImageSpout extends BaseRichSpout {
-      public static Logger LOG = LoggerFactory.getLogger(TestImageSpout.class);
+     // public static Logger LOG = LoggerFactory.getLogger(TestImageSpout.class);
       boolean _isDistributed;
       SpoutOutputCollector _collector;
 
@@ -55,7 +54,7 @@ public class ImageTopology {
 
       //////mover
 
-      static final File dir = new File("/Users/sara.rodriguez/Dev/apacheStorm/tryingStormInIntelliJ/woolf/storm-starter/src/storm/starter/images");
+      static final File dir = new File("/vagrant/storm-starter/src/storm/starter/images");
 
       static final String[] EXTENSIONS = new String[]{
               "gif", "png", "jpg"
