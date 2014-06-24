@@ -9,8 +9,10 @@ import pprint
 import kmeans
 
 DEFAULT_K_CLUSTERS = 50
-DEFAULT_HESSIAN = 700
 DEFAULT_GMRATIO = 0.8
+
+CLASSIFIER_ALG_BF = 1
+CLASSIFIER_ALG_HIST = 2
 
 pp = pprint.PrettyPrinter(indent=4)
 
@@ -30,7 +32,7 @@ def get_image_files(dir):
                 file_list.extend([full_path])
     return file_list
     
-def extract_kps_descs(dir, surf, output_dir):
+def extract_kps_descs(dir, sift):
     files_to_proc = get_image_files(dir)
     if len(files_to_proc) == 0:
         print "Found no image files in " + dir
@@ -41,40 +43,106 @@ def extract_kps_descs(dir, surf, output_dir):
     for full_path in files_to_proc:
         print "Processing " + full_path
         img = cv2.imread(full_path, 0)
-        kp, des = surf.detectAndCompute(img, None)
+        ## Rescale to 320x240 prior to feature extraction
+        img = cv2.resize(img, (320,240))
+        
+        kp, des = sift.detectAndCompute(img, None)
         
         all_kps.extend([kp])
         all_descs.extend([des])
         
-        if output_dir != "":
-            if not os.path.exists(output_dir):
-                os.makedirs(output_dir)
+        #if output_dir != "":
+        #    if not os.path.exists(output_dir):
+        #        os.makedirs(output_dir)
             ## NOTE: we don't really need this for the classification but it's just something cool(ish) to look at
-            img_kp = cv2.drawKeypoints(img, kp, None, (0,0,255), 4)
-            _, file = os.path.split(full_path)
-            if not cv2.imwrite(os.path.join(output_dir, file), img_kp):
-                print "Unable to save " + os.path.join(output_dir, file) + "!"
+        #    img_kp = cv2.drawKeypoints(img, kp, None, (0,0,255), 4)
+        #    _, file = os.path.split(full_path)
+        #    if not cv2.imwrite(os.path.join(output_dir, file), img_kp):
+        #        print "Unable to save " + os.path.join(output_dir, file) + "!"
     
     return all_kps, all_descs
     
-def extract_centroids_histogram(descs):
+def extract_centroids_histogram(descs, k = DEFAULT_K_CLUSTERS):
     if len(descs) == 0:
         return [], []
-    # First, flatten the list
-    descs2 = [item for sublist in descs for item in sublist]
-    print "Performing clustering on " + str(len(descs2)) + " descriptors..."
-    # Then perform clustering to find the best grouping of the descriptors
-    centroids, hist = kmeans.cluster(descs2, DEFAULT_K_CLUSTERS)
-    print "Done finding " + str(len(hist)) + " clusters in training descriptors "
-    hist = normalize_hist(hist)
+    print "Performing clustering on " + str(len(descs)) + " descriptors (k=" + str(k) + ")..."
+    # Perform clustering to find the best grouping of the descriptors
+    centroids, hist = kmeans.cluster(descs, k)
+    print "Found " + str(len(centroids)) + " clusters in training descriptors "
+    hist = normalize_hist(hist, k)
     return centroids, hist
     
-def do_training(training_dir, output_dir = "", hessian = DEFAULT_HESSIAN):
-    surf = cv2.SURF(hessian, upright=0)
-    kps, descs = extract_kps_descs(training_dir, surf, output_dir)
-    centroids, hist = extract_centroids_histogram(descs)
-    print "Training done! Saving training data.."
-    save_training_data(hessian, kps, descs, centroids, hist, training_dir)
+def do_loocv(descs, k):
+    correct = 0
+    ndescs = len(descs)
+    for i in range(0,ndescs):
+        # Leave this set of descriptors out of the list of all descriptors
+        descs_loocv = descs[0:i] + descs[i+1:ndescs]
+    
+        # Flatten the list of descriptors
+        descs_flat_list = [item for sublist in descs_loocv for item in sublist]
+        if k > len(descs_flat_list):
+            print "Cluster size " + str(k) + " is greater than the number of descriptors to cluster; skipping..."
+            return None
+        # Build the histogram
+        centroids, hist = extract_centroids_histogram(descs_flat_list, k)
+        # See if the resulting histogram correctly classifies the set of descriptors that was left out
+        if do_hist_diff_classification("", descs[i], centroids, hist):
+            correct+=1
+    # After going through all the descriptors, return the classification error rate
+    return (1-(float(correct)/ndescs))
+    
+def do_training(training_dir, output_file = "", validate = False):
+    #surf = cv2.SURF(hessian, upright=0)
+    sift = cv2.SIFT()
+    kps, descs = extract_kps_descs(training_dir, sift)
+
+    if len(descs) == 1:
+        # Edge case: if we only have one training image, we can't do LOOCV
+        print "Only 1 training image found; LOOCV can not be performed"
+        validate = False
+            
+    if validate:
+        # Try different values of k (number of clusters) and do LOOCV on the training dir (using hist algorithm)
+        ks = [25, 50, 75, 100]
+        k_results = {}
+        best_k = ks[0]
+        best_error_rate = None
+        for k in ks:
+            print "Starting kmeans clustering loocv with k=" + str(k)
+            error_rate = do_loocv(descs, k)
+            if error_rate is None:
+                print "Error rate: N/A\n"
+            else:    
+                print "Error rate: %.2f" % error_rate + "\n"
+            k_results[k] = error_rate
+            if error_rate is not None and (best_error_rate is None or best_error_rate > error_rate):
+                best_k = k
+                best_error_rate = error_rate
+                
+        print "CV Results on cluster size: " 
+        print " k   Error Rate"
+        for k in ks:
+            error_rate = k_results[k]
+            if error_rate is None:
+                result = "SKIPPED"
+            else:
+                result = "%.2f" % error_rate
+            print "%3s" % k + ": " + result + ("     <-- BEST" if k == best_k else "")
+        print "\n"
+    else:
+        best_k = 50
+        
+    # "Refit" a new clustering and centroids with the best k value
+    if validate:
+        print "Reclustering using k=" + str(best_k) + " as the best number of clusters" 
+    descs_flat_list = [item for sublist in descs for item in sublist]
+    centroids, hist = extract_centroids_histogram(descs_flat_list, best_k)
+    
+    if output_file == "":
+        output_file = os.path.join(training_dir, "woolf.train")
+    print "Training done! Saving training data to " + output_file
+    save_training_data(kps, descs, centroids, hist, output_file)
     
 def pickle_training_data(kps, descs, centroids, hist):
     pickle = []
@@ -95,25 +163,22 @@ def pickle_training_data(kps, descs, centroids, hist):
     pickle.append(kp_descs_pickle)
     
     # Pickle centroids
+    print "Saving " + str(len(centroids)) + " cluster centroids..."
     pickle.append(centroids)
     
     # Save histogram
     pickle.append(hist)    
     return pickle    
 
-def save_training_data(hessian, kps, descs, centroids, hist, output_dir):
-    training_pickle = [hessian]
-    
+def save_training_data( kps, descs, centroids, hist, output_file):
     # Pickle training data
-    training_pickle.append(pickle_training_data(kps, descs, centroids, hist))
+    training_pickle= [pickle_training_data(kps, descs, centroids, hist)]
         
-    training_db = os.path.join(output_dir, "woolf.train")
-    
     try:
-        pickle.dump(training_pickle, open(training_db, "wb"))
-        print "Training data saved to " + training_db
+        pickle.dump(training_pickle, open(output_file, "wb"))
+        print "Training data saved to " + output_file
     except IOError:
-        print "Could not save to training data file " + training_db
+        print "Could not save to training data file " + output_file
     
 def read_and_inc(arr, idx):
     val = arr[idx]
@@ -150,7 +215,6 @@ def unpickle_training_data(training_data_pickle):
     #pp.pprint(centroids)
     return all_kps, all_descs, centroids, histogram
     
-    
 def load_training_data(training_db):
     print "Reading from training data file " + training_db
     try:
@@ -159,14 +223,11 @@ def load_training_data(training_db):
         print "Could not open keypoints database file " + training_db
         return 0, [], [], [], {}
 
-    hessian, idx = read_and_inc(training_pickle, 0)
-    print "Loaded hessian value: " + str(hessian)
-    
     print "Loading training data"
-    training_data_pickle, idx = read_and_inc(training_pickle, idx)    
+    training_data_pickle, idx = read_and_inc(training_pickle, 0)    
     kps, descs, centroids, hist = unpickle_training_data(training_data_pickle)
     
-    return hessian, kps, descs, centroids, hist    
+    return kps, descs, centroids, hist    
 	
 def find_best_cluster(desc, centroids):
     best_cluster = 0
@@ -180,24 +241,29 @@ def find_best_cluster(desc, centroids):
         
     return best_cluster
     
-def normalize_hist(hist):
+def normalize_hist(hist, nbins):
     norm_hist = {}
     num_entries = float(sum(len(v) for v in hist.itervalues()))
-    for k in hist:
-        norm_hist[k] = len(hist[k])/num_entries
+    for i in range(0,nbins):
+        try:
+            norm_hist[i] = len(hist[i])/num_entries
+        except KeyError:
+            # If this bin doesn't exist, create it with a value of 0
+            norm_hist[i] = 0
     return norm_hist
     
 def get_hist_difference(query_hist, training_hist):
     ## Trying chi-square distance of two histograms X and Y : sum(((x_i - y_i)^2)/(x_i+y_i))) * 1/2
     total = 0
-    for cluster in query_hist:
-        sq_diff = (query_hist[cluster] - training_hist[cluster])**2
-        sum = (query_hist[cluster] + training_hist[cluster])
-        #print "Cluster " + str(cluster) + ": " + str(diff) 
-        total += (sq_diff/float(sum))
+    for bin in query_hist:
+        sq_diff = (query_hist[bin] - training_hist[bin])**2
+        sum = (query_hist[bin] + training_hist[bin])
+        #print "Cluster " + str(cluster) + ": " + str(diff)
+        if sum > 0:
+            total += (sq_diff/float(sum))
     return total/2
 
-def compute_histogram(qdescs, centroids):
+def compute_histogram(qdescs, centroids, nbins):
     hist = {}
     for qdesc in qdescs:
         best_cluster = find_best_cluster(qdesc, centroids)
@@ -206,17 +272,18 @@ def compute_histogram(qdescs, centroids):
         except KeyError:
             hist[best_cluster] = [qdesc]
     
-    return normalize_hist(hist)
+    return normalize_hist(hist, nbins)
          
-def do_bof_classification_nn(qimg_pathname, qdescs, centroids, training_hist):
-    query_hist = compute_histogram(qdescs, centroids)
+def do_hist_diff_classification(qimg_pathname, qdescs, centroids, training_hist):
+    print "Computing image histogram, #bins=" + str(len(training_hist)) 
+    query_hist = compute_histogram(qdescs, centroids, len(training_hist))
     
     hist_diff = get_hist_difference(query_hist, training_hist)
-    print "Histogram distance (chi-square): " + str(hist_diff)
+    print "Histogram distance (chi-squared): " + str(hist_diff)
     
     # Classify the image as a + if the histogram difference is below a certain threshold
-    yes_classify = (hist_diff < 0.22)
-    if yes_classify:
+    yes_classify = (hist_diff < 0.20)
+    if yes_classify and qimg_pathname != "":
         print "+++ Image " + qimg_pathname + " is a POSITIVE!"
                 
     return yes_classify 
@@ -257,14 +324,10 @@ def do_bruteforce_classification(qimg_pathname, qdescs, all_descs, bf, min_num_h
         num_min_matches = math.floor(max(len(qdescs), len(trdescs)) * 0.065)   # 6.5% of the descriptors in either query or train image
         print "Found " + str(good_matches) + " good matches (" + str(num_min_matches) + " required)" 
     
-        # Only consider this image to be of class 1 (HAS LOGO) if there are enough good matches
-        ## Possible refinement: consider query image as class 1 only if there are 
-        ## at least j matches (1 <= j <= #trainingimgs)? No theoretical basis, but it's something :D
-        ## Perhaps num_min_matches should be a proportion of the number of features extracted from query and current training desc?
-        ## Also NUM_HITS should be a function of the number of training images read from the keypoints db??
-        ## Because query images with large number of descs (>1000) tend to be classified as YES LOGO
+        # Only consider this image to be possibly positively identified if there are enough good matches
         if good_matches >= num_min_matches:
             num_hits+=1
+            ## Consider query image as positively identified only if there are at least j matches (1 <= j <= #trainingimgs)
             if num_hits == min_num_hits:
                 print "+++ Image produced " + str(num_hits) + " hits; " + qimg_pathname + " is a POSITIVE!"
                 return True
@@ -272,20 +335,20 @@ def do_bruteforce_classification(qimg_pathname, qdescs, all_descs, bf, min_num_h
             
     return False
 
-def do_classify(test_dir, training_db, output_dir, results_prefix, classify_mode_alg=1):
+def do_classify(test_dir, training_db, output_dir, results_prefix, classify_mode_alg=CLASSIFIER_ALG_BF):
     if output_dir == "":
-        output_dir = test_dir + "_out"
+        output_dir = os.path.normpath(test_dir) + "_out"
         
     if training_db == "":
-        print "A training data file should be specified (specify using -k or --keypoints)"
+        print "A training data file should be specified (specify using -d or --data)"
         return
- 
-    hessian, kps, descs, centroids, hist = load_training_data(training_db)
+
+    kps, descs, centroids, hist = load_training_data(training_db)
     if len(descs) == 0:
         print "No training data loaded"
         return
-    
-    if classify_mode_alg == 1:
+        
+    if classify_mode_alg == CLASSIFIER_ALG_BF:
         min_num_hits = len(descs)/3
         if min_num_hits == 0:
             min_num_hits = 1
@@ -310,7 +373,8 @@ def do_classify(test_dir, training_db, output_dir, results_prefix, classify_mode
         print "Found no image files in " + test_dir
         return
 
-    surf = cv2.SURF(hessian, upright=0)            
+    #surf = cv2.SURF(hessian, upright=0)            
+    sift = cv2.SIFT()            
     bf = cv2.BFMatcher(cv2.NORM_L2)
             
     for qimg_pathname in files_to_proc:
@@ -318,16 +382,17 @@ def do_classify(test_dir, training_db, output_dir, results_prefix, classify_mode
         _, qimg_filename = os.path.split(qimg_pathname)    
         
         qimg = cv2.imread(qimg_pathname, 0)
+        qimg = cv2.resize(qimg, (320,240))
                                 
         ## Get the descriptors of the query image
-        _, qdescs = surf.detectAndCompute(qimg, None)
+        _, qdescs = sift.detectAndCompute(qimg, None)
         print "Found " + str(len(qdescs)) + " descriptors in query image"
     
         yes_classify = False
-        if classify_mode_alg == 1:
+        if classify_mode_alg == CLASSIFIER_ALG_BF:
             yes_classify = do_bruteforce_classification(qimg_pathname, qdescs, descs, bf, min_num_hits)
-        else:
-            yes_classify = do_bof_classification_nn(qimg_pathname, qdescs, centroids, hist)
+        elif classify_mode_alg == CLASSIFIER_ALG_HIST:
+            yes_classify = do_hist_diff_classification(qimg_pathname, qdescs, centroids, hist)
         
         dest_path = os.path.join(output_dir_no, qimg_filename)
         if yes_classify:
@@ -335,10 +400,11 @@ def do_classify(test_dir, training_db, output_dir, results_prefix, classify_mode
         
         shutil.copyfile(qimg_pathname, dest_path)
 	
+    error_rate = None
     if results_prefix != "":
-        show_classification_results(output_dir_yes, output_dir_no, results_prefix)
-
-def show_classification_results(output_dir_yes, output_dir_no, prefix):
+        compute_classification_results(output_dir_yes, output_dir_no, results_prefix)
+    
+def compute_classification_results(output_dir_yes, output_dir_no, prefix):
     yes_yes, yes_no = count_filename_matches(output_dir_yes, prefix)
     no_yes, no_no = count_filename_matches(output_dir_no, prefix)
     
@@ -352,9 +418,10 @@ def show_classification_results(output_dir_yes, output_dir_no, prefix):
     ## Compute accuracy
     total = yes_yes + yes_no + no_yes + no_no
     correct = yes_yes + no_no
-    pct_correct = (correct/float(total)) * 100.0
-    pct_error = 100.0 - pct_correct
-    print "\nCorrectly classified: " + str(correct) + "/" + str(total) + " (%.2f" % pct_correct + "%% accuracy, %.2f" % pct_error + "% error rate)"
+    correct_rate = (correct/float(total))
+    error_rate = 1 - correct_rate
+    print "\nCorrectly classified: " + str(correct) + "/" + str(total) + " (%.2f" % (correct_rate * 100.0) + "%% accuracy, %.2f" % (error_rate * 100.0) + "% error rate)"
+    return error_rate
             
 def count_filename_matches(dir, prefix):
     yes_match = 0
@@ -375,12 +442,12 @@ def count_filename_matches(dir, prefix):
 def show_help():
     print "options: "
     print "-t, --training <training-data-dir>       Enter training mode and use given directory for training data"
-    print "-o, --output <output-dir>                Location of output descriptors (in training mode) or classified images (in classify mode) -- default is no output in training mode, <img-dir>_out in classify mode"
-    print "-1, --classify1 <img-dir>                Enter classify 1 mode (using brute force matcher) and classify the images in the given directory"
-    print "-2, --classify2 <img-dir>                Enter classify 2 mode (using image histogram matcher) and classify the images in the given directory"
+    print "-v, --validate                           Perform validation (LOOCV) when clustering in training mode -- default is false"
+    print "-o, --output <output-dir>                Location of training data file (in training mode) or classified images (in classify mode) -- default is <training-data-dir>/woolf.train training mode, <img-dir>_out in classify mode"
+    print "-c, --classify <img-dir>                 Enter classify mode, using the images in the given directory as input"
+    print "-a, --algorithm <classifier>             Use either \"bf\" (brute force) or \"hist\" (histogram) as the classifier algorithm. Default is \"bf\""
     print "-d, --data <training-data-file>          Use given file as source of training data"
-    print "-h, --hessian <hessian-value>            Hessian threshold value (only used when training -- default " + str(DEFAULT_HESSIAN) + ")"
-    print "-r, --results <prefix-value>             Check results after classification by inspecting filenames (filename that starts with the given prefix means it contains the logo)"
+    print "-r, --results <prefix-value>             Check results after classification by inspecting filenames (filename that starts with the given prefix means it should be classified as a positive)"
     
 def main(argv):
     if len(argv) == 0:
@@ -394,11 +461,11 @@ def main(argv):
     training_db = ""
     training_mode = False
     classify_mode = False
-    classify_mode_alg = 0
-    hessian = DEFAULT_HESSIAN
+    classify_mode_alg = CLASSIFIER_ALG_BF
     results_prefix = ""
+    validate = False
     try:
-        opts, args = getopt.getopt(argv,"h:t:o:1:2:d:r:",["hessian=", "training=","output=", "classify1=", "classify2=", "data=", "results="])
+        opts, args = getopt.getopt(argv,"t:vo:c:a:d:r:",["training=","validate=","output=", "classify=", "algorithm=", "data=", "results="])
     except getopt.GetoptError:
         show_help()
         sys.exit(2)
@@ -408,25 +475,23 @@ def main(argv):
             training_mode = True
         elif opt in ("-o", "--output"):
             output_dir = arg
-        elif opt in ("-1", "--classify1"):
-        
+        elif opt in ("-c", "--classify"):
             test_dir = arg
             classify_mode = True
-            classify_mode_alg = 1
-        elif opt in ("-2", "--classify2"):
-            test_dir = arg
-            classify_mode = True
-            classify_mode_alg = 2
+        elif opt in ("-a", "--algorithm"):
+            if arg == "bf":
+                classify_mode_alg = CLASSIFIER_ALG_BF
+            elif arg == "hist":
+                classify_mode_alg = CLASSIFIER_ALG_HIST
+            else:
+                print "Illegal value for -a/--algorithm: " + arg
+                sys.exit(3)
         elif opt in ("-d", "--data"):
             training_db = arg
         elif opt in ("-r", "--results"):
             results_prefix = arg
-        elif opt in ("-h", "--hessian"):
-            try:
-                hessian = arg
-            except ValueError:
-                print "Illegal value for -h/--hessian: " + arg
-                sys.exit(3)
+        elif opt in ("-v", "--validate"):
+            validate = True
             
     if not classify_mode and not training_mode:
         show_help()
@@ -435,6 +500,6 @@ def main(argv):
     if classify_mode:
         do_classify(test_dir, training_db, output_dir, results_prefix, classify_mode_alg)
     elif training_mode:
-        do_training(training_dir, output_dir, hessian)
+        do_training(training_dir, output_dir, validate)
             
 main(sys.argv[1:])

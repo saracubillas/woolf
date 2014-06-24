@@ -27,6 +27,7 @@ def cluster(X, K):
     # Initialize to K random centers
     oldmu = random.sample(X, K)
     mu = random.sample(X, K)
+    clusters = cluster_points(X, mu)
     while not has_converged(mu, oldmu):
         oldmu = mu
         # Assign all points in X to clusters
