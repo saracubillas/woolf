@@ -336,9 +336,6 @@ def do_bruteforce_classification(qimg_pathname, qdescs, all_descs, bf, min_num_h
     return False
 
 def do_classify(test_dir, training_db, output_dir, results_prefix, classify_mode_alg=CLASSIFIER_ALG_BF):
-    if output_dir == "":
-        output_dir = os.path.normpath(test_dir) + "_out"
-        
     if training_db == "":
         print "A training data file should be specified (specify using -d or --data)"
         return
@@ -354,24 +351,37 @@ def do_classify(test_dir, training_db, output_dir, results_prefix, classify_mode
             min_num_hits = 1
         print "Images must have at least " + str(min_num_hits) + " hits for a positive classification"
         
-    if os.path.exists(output_dir):
-        ## Delete its contents!
-        print "Removing " + output_dir + " prior to classification..."
-        shutil.rmtree(output_dir)
+    if os.path.isdir(test_dir):
+        if output_dir == "":
+            output_dir = os.path.normpath(test_dir) + "_out"
+            
+        if os.path.exists(output_dir):
+            ## Delete its contents!
+            print "Removing " + output_dir + " prior to classification..."
+            shutil.rmtree(output_dir)
         
-    output_dir_yes = os.path.join(output_dir, "yes")
-    output_dir_no = os.path.join(output_dir, "no")
-    if not os.path.exists(output_dir):
-        os.makedirs(output_dir)
-    if not os.path.exists(output_dir_yes):    
-        os.makedirs(output_dir_yes)
-    if not os.path.exists(output_dir_no):    
-        os.makedirs(output_dir_no)
+        output_dir_yes = os.path.join(output_dir, "yes")
+        output_dir_no = os.path.join(output_dir, "no")
+        if not os.path.exists(output_dir):
+            os.makedirs(output_dir)
+        if not os.path.exists(output_dir_yes):    
+            os.makedirs(output_dir_yes)
+        if not os.path.exists(output_dir_no):    
+            os.makedirs(output_dir_no)
 
-    files_to_proc = get_image_files(test_dir)
-    if len(files_to_proc) == 0:
-        print "Found no image files in " + test_dir
-        return
+        files_to_proc = get_image_files(test_dir)
+        if len(files_to_proc) == 0:
+            print "Found no image files in " + test_dir
+            return
+    else:
+        if not os.path.exists(test_dir):
+            print "File not found: " + test_dir
+            return
+        elif not is_image_file(test_dir):
+            print test_dir + " is not a recognized image file."
+            return
+        else:
+            files_to_proc = [test_dir]
 
     #surf = cv2.SURF(hessian, upright=0)            
     sift = cv2.SIFT()            
@@ -394,14 +404,14 @@ def do_classify(test_dir, training_db, output_dir, results_prefix, classify_mode
         elif classify_mode_alg == CLASSIFIER_ALG_HIST:
             yes_classify = do_hist_diff_classification(qimg_pathname, qdescs, centroids, hist)
         
-        dest_path = os.path.join(output_dir_no, qimg_filename)
-        if yes_classify:
-            dest_path = os.path.join(output_dir_yes, qimg_filename)
+        if os.path.isdir(test_dir):
+            dest_path = os.path.join(output_dir_no, qimg_filename)
+            if yes_classify:
+                dest_path = os.path.join(output_dir_yes, qimg_filename)
+            
+            shutil.copyfile(qimg_pathname, dest_path)
         
-        shutil.copyfile(qimg_pathname, dest_path)
-	
-    error_rate = None
-    if results_prefix != "":
+    if results_prefix != "" and os.path.isdir(test_dir):
         compute_classification_results(output_dir_yes, output_dir_no, results_prefix)
     
 def compute_classification_results(output_dir_yes, output_dir_no, prefix):
